@@ -1,0 +1,546 @@
+name: SOV Daily Bark
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "45 2 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  render-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk
+          python -m pip install --upgrade pip
+          python -m pip install openpyxl pillow
+
+      - name: Render latest SOV image
+        env:
+          SHEET_URL: "https://docs.google.com/spreadsheets/d/1k4BYMzy9DAlWHyLrAa06UA_mjxvsw8Q6UdUYSeciQmI/edit?gid=0#gid=0"
+          WORKSHEET_NAME: "SOV趋势"
+          TZ: "Asia/Shanghai"
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import os
+          import re
+          import tempfile
+          import urllib.request
+          from dataclasses import dataclass
+          from datetime import date, datetime
+          from pathlib import Path
+          from typing import Any
+          from zoneinfo import ZoneInfo
+
+          from openpyxl import load_workbook
+          from openpyxl.styles.colors import COLOR_INDEX
+          from openpyxl.utils import get_column_letter
+          from PIL import Image, ImageColor, ImageDraw, ImageFont
+
+          DATE_HEADER_RE = re.compile(r"^\d{4}-\d{1,2}-\d{1,2}$")
+          SHEET_ID_RE = re.compile(r"/spreadsheets/d/([a-zA-Z0-9-_]+)")
+
+
+          @dataclass
+          class Selection:
+              min_row: int
+              max_row: int
+              min_col: int
+              max_col: int
+
+
+          def extract_sheet_id(sheet_url: str) -> str:
+              match = SHEET_ID_RE.search(sheet_url)
+              if not match:
+                  raise ValueError("Could not extract Google Sheets ID from SHEET_URL.")
+              return match.group(1)
+
+
+          def load_source_workbook(sheet_url: str):
+              sheet_id = extract_sheet_id(sheet_url)
+              export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+              request = urllib.request.Request(
+                  export_url,
+                  headers={"User-Agent": "Mozilla/5.0 GitHubActions SOV Daily"},
+              )
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  workbook_bytes = response.read()
+
+              with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as temp_file:
+                  temp_file.write(workbook_bytes)
+                  temp_path = temp_file.name
+
+              try:
+                  return load_workbook(temp_path, data_only=True)
+              finally:
+                  Path(temp_path).unlink(missing_ok=True)
+
+
+          def resolve_worksheet(workbook, requested_name: str):
+              if requested_name in workbook.sheetnames:
+                  return workbook[requested_name]
+
+              normalized = requested_name.strip()
+              for current_name in workbook.sheetnames:
+                  if current_name.strip() == normalized:
+                      return workbook[current_name]
+
+              raise ValueError(
+                  f"Worksheet '{requested_name}' not found. Available: {', '.join(workbook.sheetnames)}"
+              )
+
+
+          def normalize_header(value: Any) -> str:
+              if value is None:
+                  return ""
+              if isinstance(value, (datetime, date)):
+                  return f"{value.year}-{value.month}-{value.day}"
+              return str(value).strip()
+
+
+          def find_header_column(worksheet, header_row: int, header_name: str) -> int:
+              for col in range(1, worksheet.max_column + 1):
+                  current = normalize_header(worksheet.cell(header_row, col).value)
+                  if current == header_name:
+                      return col
+              raise ValueError(f"Could not find header '{header_name}' in row {header_row}.")
+
+
+          def is_blank(value: Any) -> bool:
+              return value is None or str(value).strip() == ""
+
+
+          def find_last_data_row(worksheet, header_row: int, key_col: int) -> int:
+              last = header_row
+              blank_streak = 0
+              for row in range(header_row + 1, worksheet.max_row + 1):
+                  value = worksheet.cell(row, key_col).value
+                  if is_blank(value):
+                      blank_streak += 1
+                      if blank_streak >= 3:
+                          break
+                  else:
+                      blank_streak = 0
+                      last = row
+              return last
+
+
+          def resolve_selection(worksheet) -> Selection:
+              header_row = 1
+              last_n_date_columns = 7
+              trailing_column_count = 1
+              header_map = {
+                  col: normalize_header(worksheet.cell(header_row, col).value)
+                  for col in range(1, worksheet.max_column + 1)
+              }
+              date_columns = [
+                  col for col, header in header_map.items() if DATE_HEADER_RE.match(header or "")
+              ]
+              if not date_columns:
+                  raise ValueError("No date columns found in row 1.")
+
+              selected_dates = date_columns[-last_n_date_columns:]
+              key_col = find_header_column(worksheet, header_row, "品牌词")
+              max_row = find_last_data_row(worksheet, header_row, key_col)
+              return Selection(
+                  min_row=header_row,
+                  max_row=max_row,
+                  min_col=1,
+                  max_col=min(worksheet.max_column, selected_dates[-1] + trailing_column_count),
+              )
+
+
+          def build_merged_map(worksheet, selection: Selection) -> dict[tuple[int, int], tuple[int, int] | str]:
+              merged: dict[tuple[int, int], tuple[int, int] | str] = {}
+              for merged_range in worksheet.merged_cells.ranges:
+                  min_col, min_row, max_col, max_row = merged_range.bounds
+                  if (
+                      max_row < selection.min_row
+                      or min_row > selection.max_row
+                      or max_col < selection.min_col
+                      or min_col > selection.max_col
+                  ):
+                      continue
+
+                  top_left = (min_row, min_col)
+                  merged[top_left] = (max_col - min_col + 1, max_row - min_row + 1)
+                  for row in range(min_row, max_row + 1):
+                      for col in range(min_col, max_col + 1):
+                          if (row, col) != top_left:
+                              merged[(row, col)] = "skip"
+              return merged
+
+
+          def column_width_to_pixels(worksheet, col_index: int) -> int:
+              letter = get_column_letter(col_index)
+              column_dimension = worksheet.column_dimensions.get(letter)
+              width = column_dimension.width if column_dimension and column_dimension.width else 8.43
+              return max(56, int(width * 7 + 10))
+
+
+          def row_height_to_pixels(worksheet, row_index: int) -> int:
+              row_dimension = worksheet.row_dimensions.get(row_index)
+              height = row_dimension.height if row_dimension and row_dimension.height else 21
+              return max(28, int(height * 96 / 72))
+
+
+          def parse_rgb_like(value: str, default: tuple[int, int, int]) -> tuple[int, int, int]:
+              cleaned = value.replace("#", "")
+              if len(cleaned) == 8:
+                  cleaned = cleaned[2:]
+              if len(cleaned) != 6:
+                  return default
+              try:
+                  return ImageColor.getrgb(f"#{cleaned}")
+              except ValueError:
+                  return default
+
+
+          def resolve_openpyxl_color(color, default: tuple[int, int, int]) -> tuple[int, int, int]:
+              if color is None:
+                  return default
+              if color.type == "rgb" and color.rgb:
+                  return parse_rgb_like(color.rgb, default)
+              if color.type == "indexed" and color.indexed is not None:
+                  try:
+                      return parse_rgb_like(COLOR_INDEX[color.indexed], default)
+                  except (IndexError, TypeError):
+                      return default
+              return default
+
+
+          def resolve_pattern_fill_color(fill, default: tuple[int, int, int] | None):
+              if fill is None or fill.patternType in (None, "none"):
+                  return default
+              fallback = default if default is not None else (255, 255, 255)
+              return resolve_openpyxl_color(fill.fgColor, default=fallback)
+
+
+          def format_cell_value(value: Any) -> str:
+              if value is None:
+                  return ""
+              if isinstance(value, datetime):
+                  return f"{value.year}-{value.month}-{value.day}"
+              if isinstance(value, date):
+                  return f"{value.year}-{value.month}-{value.day}"
+              if isinstance(value, float) and value.is_integer():
+                  return str(int(value))
+              return str(value)
+
+
+          def build_conditional_fill_map(
+              worksheet, selection: Selection
+          ) -> dict[tuple[int, int], tuple[int, int, int]]:
+              conditional_fills: dict[tuple[int, int], tuple[int, int, int]] = {}
+              rules_by_priority: list[tuple[int, Any, Any]] = []
+
+              for conditional_formatting, rules in worksheet.conditional_formatting._cf_rules.items():
+                  for rule in rules:
+                      priority = int(getattr(rule, "priority", 10_000) or 10_000)
+                      rules_by_priority.append((priority, conditional_formatting, rule))
+
+              for _priority, conditional_formatting, rule in sorted(rules_by_priority, key=lambda item: item[0]):
+                  fill = getattr(getattr(rule, "dxf", None), "fill", None)
+                  if fill is None:
+                      continue
+
+                  fill_color = resolve_pattern_fill_color(fill, default=None)
+                  if fill_color is None:
+                      continue
+
+                  if rule.type != "beginsWith":
+                      continue
+
+                  expected_prefix = str(getattr(rule, "text", "") or "")
+                  if not expected_prefix:
+                      continue
+
+                  for cell_range in conditional_formatting.sqref.ranges:
+                      min_col = max(selection.min_col, cell_range.min_col)
+                      max_col = min(selection.max_col, cell_range.max_col)
+                      min_row = max(selection.min_row, cell_range.min_row)
+                      max_row = min(selection.max_row, cell_range.max_row)
+                      if min_col > max_col or min_row > max_row:
+                          continue
+
+                      for row in range(min_row, max_row + 1):
+                          for col in range(min_col, max_col + 1):
+                              value = format_cell_value(worksheet.cell(row, col).value).strip()
+                              if value.startswith(expected_prefix):
+                                  conditional_fills[(row, col)] = fill_color
+
+              return conditional_fills
+
+
+          def resolve_fill_color(
+              cell,
+              conditional_fill: tuple[int, int, int] | None = None,
+          ) -> tuple[int, int, int]:
+              if conditional_fill is not None:
+                  return conditional_fill
+              return resolve_pattern_fill_color(cell.fill, default=(255, 255, 255))
+
+
+          def resolve_text_color(cell) -> tuple[int, int, int]:
+              return resolve_openpyxl_color(cell.font.color, default=(26, 26, 26))
+
+
+          def load_font(size: int, bold: bool):
+              font_candidates = [
+                  "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                  "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+                  "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+              ]
+              for candidate in font_candidates:
+                  path = Path(candidate)
+                  if path.exists():
+                      try:
+                          return ImageFont.truetype(str(path), size=size)
+                      except OSError:
+                          continue
+              return ImageFont.load_default()
+
+
+          def measure_text(draw: ImageDraw.ImageDraw, text: str, font) -> tuple[int, int]:
+              bbox = draw.textbbox((0, 0), text, font=font)
+              return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+
+          def wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[str]:
+              if "\n" in text:
+                  lines: list[str] = []
+                  for chunk in text.splitlines():
+                      lines.extend(wrap_text(draw, chunk, font, max_width) or [""])
+                  return lines
+
+              if measure_text(draw, text, font)[0] <= max_width:
+                  return [text]
+
+              lines: list[str] = []
+              current = ""
+              for char in text:
+                  candidate = current + char
+                  if current and measure_text(draw, candidate, font)[0] > max_width:
+                      lines.append(current)
+                      current = char
+                  else:
+                      current = candidate
+              if current:
+                  lines.append(current)
+              return lines
+
+
+          def draw_cell_text(draw: ImageDraw.ImageDraw, rect, cell) -> None:
+              text = format_cell_value(cell.value)
+              if not text:
+                  return
+
+              font_size = int((cell.font.sz or 11) * 1.2)
+              font = load_font(font_size, bold=bool(cell.font.bold))
+              text_color = resolve_text_color(cell)
+              horizontal = cell.alignment.horizontal or "center"
+              vertical = cell.alignment.vertical or "center"
+              padding_x = 8
+              padding_y = 6
+              max_width = max(12, int(rect[2] - rect[0] - padding_x * 2))
+              lines = wrap_text(draw, text, font, max_width)
+              line_height = measure_text(draw, "Ag", font)[1] + 2
+              text_height = max(line_height, line_height * len(lines))
+              text_width = max((measure_text(draw, line, font)[0] for line in lines), default=0)
+
+              if horizontal == "left":
+                  x = rect[0] + padding_x
+              elif horizontal == "right":
+                  x = rect[2] - padding_x - text_width
+              else:
+                  x = rect[0] + (rect[2] - rect[0] - text_width) / 2
+
+              if vertical == "top":
+                  y = rect[1] + padding_y
+              elif vertical == "bottom":
+                  y = rect[3] - padding_y - text_height
+              else:
+                  y = rect[1] + (rect[3] - rect[1] - text_height) / 2
+
+              for line in lines:
+                  draw.text((x, y), line, font=font, fill=text_color)
+                  y += line_height
+
+
+          def draw_cell_border(draw: ImageDraw.ImageDraw, rect, cell) -> None:
+              border = cell.border
+              line_color = (60, 64, 67)
+              if getattr(border.left, "style", None):
+                  draw.line((rect[0], rect[1], rect[0], rect[3]), fill=line_color, width=1)
+              if getattr(border.right, "style", None):
+                  draw.line((rect[2], rect[1], rect[2], rect[3]), fill=line_color, width=1)
+              if getattr(border.top, "style", None):
+                  draw.line((rect[0], rect[1], rect[2], rect[1]), fill=line_color, width=1)
+              if getattr(border.bottom, "style", None):
+                  draw.line((rect[0], rect[3], rect[2], rect[3]), fill=line_color, width=1)
+
+
+          def render_selection(worksheet, selection: Selection) -> Image.Image:
+              padding = 20
+              col_widths = [
+                  column_width_to_pixels(worksheet, col)
+                  for col in range(selection.min_col, selection.max_col + 1)
+              ]
+              row_heights = [
+                  row_height_to_pixels(worksheet, row)
+                  for row in range(selection.min_row, selection.max_row + 1)
+              ]
+
+              table_width = sum(col_widths)
+              table_height = sum(row_heights)
+              canvas = Image.new(
+                  "RGB",
+                  (table_width + padding * 2, table_height + padding * 2),
+                  (255, 255, 255),
+              )
+              draw = ImageDraw.Draw(canvas)
+              merged_map = build_merged_map(worksheet, selection)
+              conditional_fills = build_conditional_fill_map(worksheet, selection)
+
+              y = padding
+              for row_offset, row in enumerate(range(selection.min_row, selection.max_row + 1)):
+                  x = padding
+                  for col_offset, col in enumerate(range(selection.min_col, selection.max_col + 1)):
+                      cell = worksheet.cell(row, col)
+                      span = merged_map.get((row, col))
+                      if span == "skip":
+                          x += col_widths[col_offset]
+                          continue
+
+                      col_span, row_span = (1, 1) if span is None else span
+                      width = sum(col_widths[col_offset : col_offset + col_span])
+                      height = sum(row_heights[row_offset : row_offset + row_span])
+                      rect = (x, y, x + width, y + height)
+
+                      fill = resolve_fill_color(cell, conditional_fills.get((row, col)))
+                      draw.rectangle(rect, fill=fill)
+                      draw_cell_text(draw, rect, cell)
+                      draw_cell_border(draw, rect, cell)
+                      x += col_widths[col_offset]
+                  y += row_heights[row_offset]
+
+              draw.rectangle(
+                  (padding, padding, padding + table_width, padding + table_height),
+                  outline=(60, 64, 67),
+                  width=1,
+              )
+              return canvas
+
+
+          tz = ZoneInfo(os.environ.get("TZ", "Asia/Shanghai"))
+          today_text = datetime.now(tz).strftime("%Y-%m-%d")
+          workbook = load_source_workbook(os.environ["SHEET_URL"])
+          worksheet = resolve_worksheet(workbook, os.environ["WORKSHEET_NAME"])
+          selection = resolve_selection(worksheet)
+          image = render_selection(worksheet, selection)
+
+          output_dir = Path("images")
+          output_dir.mkdir(parents=True, exist_ok=True)
+          dated_path = output_dir / f"sov-trend-{today_text}.png"
+          latest_path = output_dir / "sov-trend-latest.png"
+          image.save(dated_path)
+          image.save(latest_path)
+
+          env_file = os.environ.get("GITHUB_ENV")
+          if env_file:
+              with open(env_file, "a", encoding="utf-8") as handle:
+                  handle.write(f"SOV_DATE={today_text}\n")
+
+          print(f"Rendered image: {dated_path}")
+          print(
+              "Rendered range: "
+              f"{worksheet.title}!{get_column_letter(selection.min_col)}{selection.min_row}:"
+              f"{get_column_letter(selection.max_col)}{selection.max_row}"
+          )
+          PY
+
+      - name: Commit rendered images
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add images/
+          if git diff --cached --quiet; then
+            echo "No image changes to commit."
+          else
+            git commit -m "Update SOV daily image for ${SOV_DATE}"
+            git push
+          fi
+          echo "IMAGE_COMMIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Push Bark notification
+        env:
+          BARK_DEVICE_KEY: ${{ secrets.BARK_DEVICE_KEY }}
+          SHEET_URL: "https://docs.google.com/spreadsheets/d/1k4BYMzy9DAlWHyLrAa06UA_mjxvsw8Q6UdUYSeciQmI/edit?gid=0#gid=0"
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          import time
+          import urllib.request
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          bark_key = os.environ["BARK_DEVICE_KEY"]
+          sheet_url = os.environ["SHEET_URL"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          commit_sha = os.environ["IMAGE_COMMIT_SHA"]
+          sov_date = os.environ["SOV_DATE"]
+
+          image_url = (
+              f"https://raw.githubusercontent.com/{repo}/{commit_sha}/images/"
+              f"sov-trend-{sov_date}.png"
+          )
+
+          for _ in range(10):
+              try:
+                  with urllib.request.urlopen(image_url, timeout=15) as response:
+                      if response.status == 200:
+                          break
+              except Exception:
+                  time.sleep(3)
+          else:
+              raise RuntimeError(f"Public image URL did not become ready: {image_url}")
+
+          payload = {
+              "device_key": bark_key,
+              "title": "SOV趋势日报",
+              "body": f"{sov_date} SOV趋势已生成",
+              "group": "sov-daily",
+              "level": "active",
+              "isArchive": 1,
+              "url": sheet_url,
+              "image": image_url,
+          }
+
+          request = urllib.request.Request(
+              "https://api.day.app/push",
+              data=json.dumps(payload).encode("utf-8"),
+              headers={"Content-Type": "application/json; charset=utf-8"},
+              method="POST",
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              print(response.read().decode("utf-8"))
+          PY
